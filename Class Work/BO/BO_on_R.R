@@ -1,0 +1,366 @@
+library(mlr3mbo)
+library(mlr3)
+library(mlr3learners)
+library(bbotk)
+library(data.table)
+file <- "D:/MSE/5820x/Class Work/BO/ML_initial.csv"
+data <- as.data.table(read.csv(file))
+data
+
+
+round_to_nearest <- function(x, metadata) {
+  to_nearest = metadata$to_nearest
+  x_columns = metadata$X_columns
+  print("Metadata$to_nearest:")
+  print(to_nearest)
+  print("Metadata$X_columns:")
+  print(x_columns)
+  
+  # Apply rounding only to metadata$X_columns 
+  if (is.data.table(x) || is.data.frame(x)) {
+    for (col_name in names(x)) {
+      if (col_name %in% x_columns) {
+        col = x[[col_name]]
+        if (is.numeric(col)) {
+          nearest = as.numeric(to_nearest[[col_name]])
+          print(paste("Column:", col_name))
+          print(paste("Nearest value:", nearest))
+          print("Values before rounding:")
+          print(col)
+          x[[col_name]] = round(col / nearest) * nearest
+          print("Values after rounding:")
+          print(x[[col_name]])
+        }
+      } else {
+        print(paste("Skipping column:", col_name))
+      }
+    }
+  } else if (is.numeric(x)) {
+    nearest = as.numeric(to_nearest)
+    print("Nearest value:")
+    print(nearest)
+    print("Values before rounding:")
+    print(x)
+    x <- round(x / nearest) * nearest
+    print("Values after rounding:")
+    print(x)
+  } else {
+    stop("x must be a data.table, data.frame, or numeric vector")
+  }
+  return(x)
+}
+
+
+save_archive <- function(archive, acq_function, acq_optimizer, metadata) {
+  # Get the current timestamp
+  timestamp <- format(Sys.time(), "%Y%m%d-%H%M")
+  
+  # Define the directory path
+  dir_path = paste0("D:/MSE/5820x/Class Work/BO/", metadata$bucket_name, "/", metadata$batch_number)    
+  
+  # Create the directory if it doesn't exist
+  if (!dir.exists(dir_path)) {
+    dir.create(dir_path, recursive = TRUE)
+  }
+  
+  # Save the objects to files with timestamp
+  saveRDS(archive, paste0(dir_path,  "/archive-", timestamp, ".rds"))
+  saveRDS(acq_function, paste0(dir_path, "/acqf-", timestamp, ".rds"))
+  saveRDS(acq_optimizer, paste0(dir_path, "/acqopt-", timestamp, ".rds"))
+  # Save the objects to files
+  saveRDS(archive, paste0(dir_path,  "/archive.rds"))
+  saveRDS(acq_function, paste0(dir_path, "/acqf.rds"))
+  saveRDS(acq_optimizer, paste0(dir_path, "/acqopt.rds"))
+}
+
+update_and_optimize <- function(acq_function, acq_optimizer, tmp_archive, candidate_new, lie, metadata) {
+  print("11-here in update_and_optimize function:")
+  acq_function$surrogate$update()
+  acq_function$update()
+  tmp_archive$add_evals(xdt = candidate_new,
+                        xss_trafoed = transform_xdt_to_xss(candidate_new,
+                                                           tmp_archive$search_space),
+                        ydt = lie)
+  candidate_new = acq_optimizer$optimize()
+  candidate_new = round_to_nearest(candidate_new, metadata)
+  return(candidate_new)
+}
+
+add_evals_to_archive <- function(archive, acq_function, acq_optimizer, data, q, metadata) {
+  # Check inputs
+  if (!is.data.table(archive$data)) {
+    stop("archive$data must be a data.table")
+  }
+  
+  print("Metadata$to_nearest:")
+  print(metadata$to_nearest)
+  
+  min_value <- min
+  acq_function$surrogate$update()
+  acq_function$update()
+  
+  candidate <- acq_optimizer$optimize()
+  
+  print("Candidate after optimize before rounding:")
+  print(candidate)
+  
+  candidate <- round_to_nearest(candidate, metadata)
+  print("Candidate after rounding:")
+  print(candidate)
+  
+  tmp_archive = archive$clone(deep = TRUE)
+  acq_function$surrogate$archive = tmp_archive
+  
+  min_values <- data.table()
+  
+  # Apply the liar function to each column in archive$cols_y
+  for (col_name in archive$cols_y) {
+    min_values[, (col_name) := min_value(archive$data[[col_name]])]
+  }
+  
+  candidate_new = candidate
+  
+  print("Candidate_new before update loop:")
+  print(candidate_new)
+  
+  for (i in seq_len(q)) {
+    
+    # Predict y or y1 y2 for the new candidate
+    prediction <- acq_function$surrogate$predict(candidate_new)
+    
+    col_names <- c(paste0(archive$cols_y[1], "_mean"), paste0(archive$cols_y[1], "_se"))
+    if (length(archive$cols_y) > 1) {
+      col_names <- c(col_names, paste0(archive$cols_y[2], "_mean"), paste0(archive$cols_y[2], "_se"))
+    }
+    # print("Column names:")
+    # print(col_names)
+    
+    # Add new columns to candidate
+    for (col_name in col_names) {
+      if (!col_name %in% names(candidate_new)) {
+        candidate_new[, (col_name) := NA]
+      }
+    }
+    
+    # Add the predicted mean values [1] and their standard errors [2] to candidate_new
+    if (length(archive$cols_y) > 1) {
+      candidate_new[, (col_names) := .(prediction[[1]]$mean[1], prediction[[1]]$se[1],
+                                       prediction[[2]]$mean[1], prediction[[2]]$se[1])]
+    } else {
+      candidate_new[, (col_names) := .(prediction$mean[1], prediction$se[1])]
+    }
+    
+    print(paste("Iteration", i, "candidate_new before update_optimize:"))
+    print(candidate_new)
+    
+    if (i > 1) {
+      candidate <- rbind(candidate, candidate_new, fill = TRUE)
+    } else {
+      candidate <- candidate_new
+    }
+    if (i < q) {
+      candidate_new <- update_and_optimize(acq_function, acq_optimizer,
+                                           tmp_archive, candidate_new,
+                                           min_values, metadata)
+    }
+    print("Candidate_new after update_and_optimize:")
+    print(candidate_new)
+  }
+  
+  # Iterate over each column in candidate
+  for (col in names(candidate_new)) {
+    # If the column is numeric, round and format it
+    if (is.double(candidate_new[[col]])) {
+      candidate_new[[col]] <- format(round(candidate_new[[col]], 2), nsmall = 2)
+    }
+  }
+  
+  save_archive(archive, acq_function, acq_optimizer, metadata)
+  return(list(candidate, archive, acq_function))
+}
+
+experiment <- function(data, metadata) {
+  print("1-experiment_function started")
+  set.seed(metadata$seed)
+  print("2-data is loaded as below:")
+  data <- as.data.table(data) # data.csv is queried `table`
+  print(data)
+  # Initialize a list to store parameters for search_space
+  search_space_list <- list()
+  
+  # Loop through metadata$parameter_info
+  print("3-Loop through metadata$parameter_info to store input parameters for search space:")
+  for (param_name in names(metadata$parameter_info)) {
+    print(paste("Parameter name: ", param_name))
+    param_info <- metadata$parameter_info[[param_name]]
+    param_range <- metadata$parameter_ranges[[param_name]]
+    
+    # print(paste("Param info:", param_info))
+    # print(paste("Param range:", param_range))
+    
+    # Check if param_info is 'object', if so, no need to convert to numeric
+    print(paste("Adding parameter to search_space with id: ", param_name))
+    if (param_info == "object") {
+      search_space_list[[param_name]] <- p_fct(levels = param_range)
+      next
+    }
+    
+    # Convert the results to appropriate type
+    if (param_info == "integer") {
+      lower = as.integer(param_range[1])
+      upper = as.integer(param_range[2])
+    } else if (param_info == "float") {
+      lower = as.numeric(param_range[1])
+      upper = as.numeric(param_range[2])
+    }
+    
+    # Check if lower or upper is NA
+    if (is.na(lower) | is.na(upper)) {
+      print(paste("lower or upper is NA for param_name:", param_name))
+      next
+    }
+    
+    # Add the parameter to the search space
+    if (param_info == "float") {
+      search_space_list[[param_name]] <- p_dbl(lower = lower, upper = upper)
+    } else if (param_info == "integer") {
+      search_space_list[[param_name]] <- p_int(lower = lower, upper = upper)
+    }
+  }
+  
+  # Create the ParamSet for search_space using the ps() function
+  search_space <- do.call(ps, search_space_list)
+  
+  # Initialize an empty ParamSet for the codomain
+  codomain_list = list()
+  
+  # Loop through metadata$output_column_names
+  print("4-Loop through metadata$output_column_nameso to store output parameters for search space:")
+  for (output_name in names(metadata$directions)) {
+    print(paste("Adding output to codomain with id: ", output_name))
+    direction <- toString(metadata$directions[[output_name]])
+    
+    # Add the output to the codomain
+    codomain_list[[output_name]] <- p_dbl(tags = direction)
+  }
+  
+  # Create the ParamSet for codomain using the ps() function
+  codomain <- do.call(ps, codomain_list)
+  print("5- An empty archive is created as below: ")
+  archive <- ArchiveBatch$new(search_space = search_space, codomain = codomain)
+  print(archive)
+  print("5A- Archive class: ")
+  
+  class(archive)
+  
+  # print(metadata$output_column_names)
+  
+  print(unique(data$output2))
+  
+  
+  # Use parameter_info in the subset operation
+  archive$add_evals(xdt = data[, names(metadata$parameter_info), with = FALSE],
+                    ydt = data[, metadata$output_column_names, with = FALSE])
+  
+  print("6- input and output values created from data and added to the archive, Model archive so far: ")
+  print(archive)
+  # Determine the number of objectives
+  num_objectives <- length(metadata$output_column_names)
+  print("7A- aquisition function and optimizer is created")
+  
+  if (num_objectives == 1) {
+    #surrogate <- srlrn(lrn("regr.ranger"), archive = archive)
+    surrogate <- srlrn(default_rf(), archive = archive)
+    acq_function <- acqf("ei", surrogate = surrogate)
+  } else {
+    surrogate <- srlrn(list(default_rf(), default_rf()), archive = archive)
+    acq_function <- acqf("ehvi", surrogate = surrogate)
+  }
+  print("7A- aquisition optimizer is created ")
+  
+  # single or multi
+  acq_optimizer <- acqo(opt("random_search", batch_size = 1000),
+                        terminator = trm("evals", n_evals = 1000),
+                        acq_function = acq_function)
+  
+  q <- as.integer(metadata$num_random_lines)
+  print("8- A list called result is created by using add_evals_to_archive function")
+  
+  result <- add_evals_to_archive(archive, acq_function,
+                                 acq_optimizer, data, q, metadata)
+  print("15A- result was created and archive is: ")
+  
+  candidate <- result[[1]]
+  archive <- result[[2]]
+  acq_function <- result[[3]]
+  
+  print(archive)
+  print("15B- acq_function$surrogate$archive is:")
+  print(acq_function$surrogate$archive)
+  
+  x2 <- candidate[, names(metadata$parameter_info), with = FALSE]
+  print("New candidates: ")
+  print(x2)
+  print("16- New archive: ")
+  print(archive)
+  
+  x2_dt <- as.data.table(x2)
+  
+  # Create data_no_preds by combining data and x2_dt
+  data_no_preds <- rbindlist(list(data, x2_dt), fill = TRUE)
+  
+  # Create data_with_preds by combining data and candidate
+  candidate_with_preds <- candidate[, -c(".already_evaluated","x_domain"), with = FALSE]
+  data_with_preds <- rbindlist(list(data, candidate_with_preds), fill = TRUE)
+  dir_path = paste0("D:/MSE/5820x/Class Work/BO/", metadata$bucket_name, "/", metadata$batch_number)    
+  
+  print("Data no preds: ")
+  print(data_no_preds)
+  data.table::fwrite(data_no_preds, paste0(dir_path, "/output.csv"))
+  print(paste0("mlr3mbo update is finished.
+               Results file is saved at: ", dir_path))
+  print("Data with preds: ")
+  print(data_with_preds)
+  data.table::fwrite(data_with_preds, paste0(dir_path, "/with-preds_output.csv"))
+  print(paste0("mlr3mbo update is finished.
+               Results file is saved at: ", dir_path))
+  # Combine the results into a list
+  result <- list(data_no_preds = data_no_preds, data_with_preds = data_with_preds)
+  
+  print("Returning data to streamlit")
+  return(result)
+}
+
+metadata <- list(
+  seed = 42,
+  # The name of the bucket where the archive will be saved
+  bucket_name = "Dual_Opt1",
+  # user_id = "my_id",  # The user ID
+  # table_name = "CuAlMnNi",  # The name of the table
+  batch_number = "1",  # The batch number
+  parameter_info = list(
+    param1 = "float",  # The type of the Al parameter
+    param2 = "float", # The type of the Ni parameter
+    param3 = "float" # The type of the Ni parameter
+    # Add more parameters as needed
+  ),
+  parameter_ranges = list(
+    param1 = c(-5, 5),  # The range of the Al parameter
+    param2 = c(-5, 5),  # The range of the Mn parameter
+    param3 = c(-5, 5)  # The range of the Mn parameter
+    # Add more ranges as needed
+  ),
+  output_column_names = c("target"),  # The names of the output columns
+  # Ignored from the search space, but calculated in post-processing
+  # calculated_column = "Cu",
+  # The direction of the optimization ("minimize" or "maximize")
+  directions = list(
+    target = "minimize"
+  ),  num_random_lines = 3,  # The number of random lines to generate
+  to_nearest = 0.1  # The value to round to
+)
+
+#%%
+# Run the experiment function
+result <- experiment(data, metadata)
+

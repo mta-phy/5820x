@@ -1,0 +1,10 @@
+install.packages(c(
+  "mlr3mbo",
+  "mlr3",
+  "mlr3learners",
+  "bbotk",
+  "data.table",
+  "tibble",
+  "R.utils",
+  "ranger"
+))
